@@ -1,114 +1,215 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { supabase } from "@/lib/supabaseClient";
+import { useAuth } from "@/lib/auth/AuthProvider";
 
-type Section = {
+type CourseRow = {
   id: string;
   title: string;
-  items: { id: string; type: "PDF" | "Vidéo" | "Lien"; label: string }[];
+  description: string | null;
+  status: "active" | "archived";
+  created_at: string;
+  updated_at: string;
 };
 
-type Assessment = {
+type SectionRow = {
+  id: string;
+  title: string;
+  order_index: number;
+};
+
+type ResourceRow = {
+  id: string;
+  section_id: string | null;
+  type: "pdf" | "video" | "link" | "file";
+  title: string;
+  url: string;
+};
+
+type AssessmentRow = {
+  id: string;
+  type: "quiz" | "assignment" | "exam";
+  title: string;
+  due_at: string | null;
+  status: "draft" | "published" | "closed";
+};
+
+type SectionView = {
+  id: string;
+  title: string;
+  items: {
+    id: string;
+    type: "PDF" | "Vidéo" | "Lien" | "Fichier";
+    label: string;
+    url: string;
+  }[];
+};
+
+type AssessmentView = {
   id: string;
   type: "Quiz" | "Devoir" | "Examen";
   title: string;
-  className: string;
   when: string;
-  status: "Brouillon" | "Publié";
+  status: "Brouillon" | "Publié" | "Clôturé";
 };
+
+function resourceTypeLabel(type: ResourceRow["type"]): "PDF" | "Vidéo" | "Lien" | "Fichier" {
+  if (type === "pdf") return "PDF";
+  if (type === "video") return "Vidéo";
+  if (type === "link") return "Lien";
+  return "Fichier";
+}
+
+function assessmentTypeLabel(type: AssessmentRow["type"]): "Quiz" | "Devoir" | "Examen" {
+  if (type === "assignment") return "Devoir";
+  if (type === "exam") return "Examen";
+  return "Quiz";
+}
+
+function assessmentStatusLabel(
+  status: AssessmentRow["status"]
+): "Brouillon" | "Publié" | "Clôturé" {
+  if (status === "published") return "Publié";
+  if (status === "closed") return "Clôturé";
+  return "Brouillon";
+}
+
+function formatDueAt(value: string | null) {
+  if (!value) return "Sans échéance";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString();
+}
+
+function badgeClass(type: "Quiz" | "Devoir" | "Examen") {
+  if (type === "Examen") return "sn-badge sn-badge-red";
+  if (type === "Devoir") return "sn-badge sn-badge-blue";
+  return "sn-badge sn-badge-gray";
+}
 
 export default function TeacherCourseDetail() {
   const navigate = useNavigate();
-  const { courseId } = useParams();
+  const { courseId } = useParams<{ courseId: string }>();
+  const { user, loading: authLoading } = useAuth();
 
-  const course = useMemo(() => {
-    // Démo : on mappe un titre selon courseId
-    const map: Record<string, string> = {
-      math6b: "Maths — 6e B",
-      math5a: "Maths — 5e A",
-      sci6b: "Sciences — 6e B",
-    };
-    return {
-      id: courseId || "math6b",
-      title: map[courseId || "math6b"] || "Cours",
-      subtitle: "Plan de cours, ressources et évaluations liées",
-    };
-  }, [courseId]);
+  const [course, setCourse] = useState<CourseRow | null>(null);
+  const [sections, setSections] = useState<SectionView[]>([]);
+  const [assessments, setAssessments] = useState<AssessmentView[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const [sections, setSections] = useState<Section[]>(
-    useMemo(
-      () => [
-        {
-          id: "s1",
-          title: "Chapitre 1 — Nombres entiers",
-          items: [
-            { id: "i1", type: "PDF", label: "Cours (PDF)" },
-            { id: "i2", type: "Vidéo", label: "Vidéo explicative" },
-          ],
-        },
-        {
-          id: "s2",
-          title: "Chapitre 2 — Fractions",
-          items: [{ id: "i3", type: "Lien", label: "Exercices en ligne" }],
-        },
-      ],
-      []
-    )
-  );
+  const loadCourseDetail = useCallback(async () => {
+    if (!courseId) {
+      setError("Cours introuvable.");
+      setLoading(false);
+      return;
+    }
 
-  const [assessments] = useState<Assessment[]>(
-    useMemo(
-      () => [
-        {
-          id: "a1",
-          type: "Quiz",
-          title: "Quiz — Chapitre 1",
-          className: "6e B",
-          when: "Aujourd’hui",
-          status: "Publié",
-        },
-        {
-          id: "a2",
-          type: "Devoir",
-          title: "Devoir — Exercices Fractions",
-          className: "6e B",
-          when: "À rendre mardi",
-          status: "Brouillon",
-        },
-        {
-          id: "a3",
-          type: "Examen",
-          title: "Examen — Trimestre 1",
-          className: "6e B",
-          when: "Jeudi 10:00",
-          status: "Publié",
-        },
-      ],
-      []
-    )
-  );
+    if (!user || user.isDemo) {
+      setCourse(null);
+      setSections([]);
+      setAssessments([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
 
-  function addSection() {
-    const next = {
-      id: `s${sections.length + 1}`,
-      title: `Nouvelle section ${sections.length + 1}`,
-      items: [],
-    };
-    setSections((prev) => [next, ...prev]);
-  }
+    try {
+      setLoading(true);
+      setError(null);
 
-  function badgeClass(t: "Quiz" | "Devoir" | "Examen") {
-    if (t === "Examen") return "sn-badge sn-badge-red";
-    if (t === "Devoir") return "sn-badge sn-badge-blue";
-    return "sn-badge sn-badge-gray";
-  }
+      const [courseResult, sectionsResult, resourcesResult, assessmentsResult] =
+        await Promise.all([
+          supabase
+            .from("courses")
+            .select("id, title, description, status, created_at, updated_at")
+            .eq("id", courseId)
+            .single(),
+
+          supabase
+            .from("course_sections")
+            .select("id, title, order_index")
+            .eq("course_id", courseId)
+            .order("order_index", { ascending: true }),
+
+          supabase
+            .from("resources")
+            .select("id, section_id, type, title, url")
+            .eq("course_id", courseId)
+            .order("created_at", { ascending: true }),
+
+          supabase
+            .from("assessments")
+            .select("id, type, title, due_at, status")
+            .eq("course_id", courseId)
+            .order("created_at", { ascending: false }),
+        ]);
+
+      if (courseResult.error) throw courseResult.error;
+      if (sectionsResult.error) throw sectionsResult.error;
+      if (resourcesResult.error) throw resourcesResult.error;
+      if (assessmentsResult.error) throw assessmentsResult.error;
+
+      const courseData = courseResult.data as CourseRow;
+      const sectionRows = (sectionsResult.data ?? []) as SectionRow[];
+      const resourceRows = (resourcesResult.data ?? []) as ResourceRow[];
+      const assessmentRows = (assessmentsResult.data ?? []) as AssessmentRow[];
+
+      const sectionsView: SectionView[] = sectionRows.map((section) => ({
+        id: section.id,
+        title: section.title,
+        items: resourceRows
+          .filter((resource) => resource.section_id === section.id)
+          .map((resource) => ({
+            id: resource.id,
+            type: resourceTypeLabel(resource.type),
+            label: resource.title,
+            url: resource.url,
+          })),
+      }));
+
+      const assessmentsView: AssessmentView[] = assessmentRows.map((assessment) => ({
+        id: assessment.id,
+        type: assessmentTypeLabel(assessment.type),
+        title: assessment.title,
+        when: formatDueAt(assessment.due_at),
+        status: assessmentStatusLabel(assessment.status),
+      }));
+
+      setCourse(courseData);
+      setSections(sectionsView);
+      setAssessments(assessmentsView);
+    } catch (err) {
+      console.error("[TeacherCourseDetail] loadCourseDetail error:", err);
+      setError("Impossible de charger le détail du cours.");
+      setCourse(null);
+      setSections([]);
+      setAssessments([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [courseId, user]);
+
+  useEffect(() => {
+    if (authLoading) return;
+    void loadCourseDetail();
+  }, [authLoading, loadCourseDetail]);
+
+  const sectionCountLabel = useMemo(() => `${sections.length} section(s)`, [sections.length]);
+
+  const subtitle = useMemo(() => {
+    if (!course) return "";
+    return course.description?.trim() || "Plan de cours, ressources et évaluations liées";
+  }, [course]);
+
+  const isLoading = authLoading || loading;
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-xl font-semibold">{course.title}</div>
-          <div className="text-sm text-gray-500">{course.subtitle}</div>
+          <div className="text-xl font-semibold">{course?.title ?? "Cours"}</div>
+          <div className="text-sm text-gray-500">{subtitle}</div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -117,170 +218,66 @@ export default function TeacherCourseDetail() {
           </button>
           <button
             className="sn-btn-ghost sn-press"
-            onClick={() => alert("Paramètres (démo)")}
+            onClick={() => alert("Paramètres du cours (à venir)")}
           >
             Paramètres
           </button>
         </div>
       </div>
 
-      {/* Actions rapides */}
-      <div className="sn-card p-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="text-sm text-gray-700">
-          Actions rapides : ajoute des ressources ou crée une évaluation liée au
-          cours.
+      {user?.isDemo && (
+        <div className="sn-card p-4 text-sm text-amber-700 bg-amber-50 border border-amber-200">
+          Mode démo actif : les données réelles ne sont pas chargées.
         </div>
-        <div className="flex flex-wrap gap-2">
-          <button className="sn-btn-ghost sn-press" onClick={addSection}>
-            + Ajouter une section
-          </button>
-          <button
-            className="sn-btn-primary sn-press"
-            onClick={() =>
-              navigate(`/app/teacher/assessments/new?course=${course.id}`)
-            }
-          >
-            + Créer une évaluation
-          </button>
-        </div>
-      </div>
+      )}
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        {/* Sections */}
-        <div className="lg:col-span-2 space-y-4">
-          <div className="sn-card p-5">
-            <div className="flex items-center justify-between">
-              <div className="font-semibold">Sections / Chapitres</div>
-              <span className="sn-badge sn-badge-gray">
-                {sections.length} sections
-              </span>
+      {isLoading && (
+        <div className="space-y-4">
+          <div className="sn-card p-4 animate-pulse">
+            <div className="h-4 w-1/3 rounded bg-gray-200" />
+          </div>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="lg:col-span-2 sn-card p-5 animate-pulse space-y-3">
+              <div className="h-5 w-1/3 rounded bg-gray-200" />
+              <div className="h-20 rounded bg-gray-100" />
+              <div className="h-20 rounded bg-gray-100" />
             </div>
-
-            <div className="mt-4 space-y-3">
-              {sections.map((s) => (
-                <div key={s.id} className="rounded-2xl border border-gray-100 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="font-semibold text-gray-900">{s.title}</div>
-                      <div className="text-sm text-gray-500">
-                        {s.items.length} ressource(s)
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <button
-                        className="sn-btn-ghost sn-press"
-                        type="button"
-                        onClick={() => alert("Ajouter ressource (démo)")}
-                      >
-                        + Ressource
-                      </button>
-
-                      <button
-                        className="sn-btn-primary sn-press"
-                        type="button"
-                        onClick={() =>
-                          navigate(
-                            `/app/teacher/assessments/new?course=${course.id}&section=${s.id}`
-                          )
-                        }
-                      >
-                        + Évaluation
-                      </button>
-                    </div>
-                  </div>
-
-                  {s.items.length > 0 && (
-                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                      {s.items.map((it) => (
-                        <div
-                          key={it.id}
-                          className="rounded-2xl bg-gray-50 border border-gray-100 p-3 flex items-center justify-between"
-                        >
-                          <div className="text-sm text-gray-800">
-                            <span className="font-semibold">{it.type}</span>{" "}
-                            <span className="text-gray-600">— {it.label}</span>
-                          </div>
-                          <button
-                            className="sn-btn-ghost sn-press"
-                            type="button"
-                            onClick={() => alert("Ouvrir ressource (démo)")}
-                          >
-                            Ouvrir
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
+            <div className="sn-card p-5 animate-pulse space-y-3">
+              <div className="h-5 w-1/2 rounded bg-gray-200" />
+              <div className="h-20 rounded bg-gray-100" />
+              <div className="h-20 rounded bg-gray-100" />
             </div>
           </div>
         </div>
+      )}
 
-        {/* Évaluations liées */}
-        <div className="space-y-4">
-          <div className="sn-card sn-card-hover p-5">
-            <div className="flex items-center justify-between">
-              <div className="font-semibold">Évaluations liées</div>
+      {!isLoading && error && (
+        <div className="sn-card p-5 border border-red-200 bg-red-50 text-red-700 space-y-3">
+          <div className="font-medium">Erreur de chargement</div>
+          <div className="text-sm">{error}</div>
+          <button className="sn-btn-primary sn-press w-fit" onClick={() => void loadCourseDetail()}>
+            Réessayer
+          </button>
+        </div>
+      )}
+
+      {!isLoading && !error && (
+        <>
+          <div className="sn-card p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="text-sm text-gray-700">
+              Actions rapides : ajoute des ressources ou crée une évaluation liée au cours.
+            </div>
+            <div className="flex flex-wrap gap-2">
               <button
                 className="sn-btn-ghost sn-press"
-                onClick={() => navigate("/app/teacher/assessments")}
+                onClick={() => alert("Ajout de section (à venir)")}
               >
-                Voir tout
+                + Ajouter une section
               </button>
-            </div>
-
-            <div className="mt-4 space-y-3">
-              {assessments.map((a) => (
-                <div key={a.id} className="rounded-2xl border border-gray-100 p-4">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="font-semibold text-gray-900">{a.title}</div>
-                      <div className="text-sm text-gray-500">
-                        {a.className} • {a.when}
-                      </div>
-                    </div>
-                    <span className={badgeClass(a.type)}>{a.type}</span>
-                  </div>
-
-                  <div className="mt-3 flex items-center justify-between">
-                    <span
-                      className={
-                        a.status === "Publié"
-                          ? "sn-badge sn-badge-green"
-                          : "sn-badge sn-badge-gray"
-                      }
-                    >
-                      {a.status}
-                    </span>
-
-                    <div className="flex gap-2">
-                      <button
-                        className="sn-btn-ghost sn-press"
-                        type="button"
-                        onClick={() => navigate("/app/teacher/grading")}
-                      >
-                        Corrections
-                      </button>
-                      <button
-                        className="sn-btn-primary sn-press"
-                        type="button"
-                        onClick={() => alert("Ouvrir évaluation (démo)")}
-                      >
-                        Ouvrir
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <div className="mt-4">
               <button
-                className="sn-btn-primary w-full sn-press"
+                className="sn-btn-primary sn-press"
                 onClick={() =>
-                  navigate(`/app/teacher/assessments/new?course=${course.id}`)
+                  navigate(`/app/teacher/assessments/new?course=${courseId ?? ""}`)
                 }
               >
                 + Créer une évaluation
@@ -288,19 +285,175 @@ export default function TeacherCourseDetail() {
             </div>
           </div>
 
-          <div className="sn-card p-5">
-            <div className="font-semibold">Aperçu</div>
-            <div className="mt-2 text-sm text-gray-500">
-              À terme, cette zone affichera :
-              <ul className="list-disc pl-5 mt-2 space-y-1">
-                <li>Progression moyenne</li>
-                <li>Dernières activités</li>
-                <li>Alertes (copies en retard)</li>
-              </ul>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="lg:col-span-2 space-y-4">
+              <div className="sn-card p-5">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">Sections / Chapitres</div>
+                  <span className="sn-badge sn-badge-gray">{sectionCountLabel}</span>
+                </div>
+
+                {sections.length === 0 ? (
+                  <div className="mt-4 rounded-2xl border border-gray-100 bg-gray-50 p-4 text-sm text-gray-600">
+                    Aucune section pour le moment.
+                  </div>
+                ) : (
+                  <div className="mt-4 space-y-3">
+                    {sections.map((section) => (
+                      <div key={section.id} className="rounded-2xl border border-gray-100 p-4">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="font-semibold text-gray-900">{section.title}</div>
+                            <div className="text-sm text-gray-500">
+                              {section.items.length} ressource(s)
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <button
+                              className="sn-btn-ghost sn-press"
+                              type="button"
+                              onClick={() => alert("Ajouter ressource (à venir)")}
+                            >
+                              + Ressource
+                            </button>
+
+                            <button
+                              className="sn-btn-primary sn-press"
+                              type="button"
+                              onClick={() =>
+                                navigate(
+                                  `/app/teacher/assessments/new?course=${courseId ?? ""}&section=${section.id}`
+                                )
+                              }
+                            >
+                              + Évaluation
+                            </button>
+                          </div>
+                        </div>
+
+                        {section.items.length > 0 && (
+                          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                            {section.items.map((item) => (
+                              <div
+                                key={item.id}
+                                className="rounded-2xl bg-gray-50 border border-gray-100 p-3 flex items-center justify-between"
+                              >
+                                <div className="text-sm text-gray-800">
+                                  <span className="font-semibold">{item.type}</span>{" "}
+                                  <span className="text-gray-600">— {item.label}</span>
+                                </div>
+                                <button
+                                  className="sn-btn-ghost sn-press"
+                                  type="button"
+                                  onClick={() => window.open(item.url, "_blank", "noopener,noreferrer")}
+                                >
+                                  Ouvrir
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="sn-card sn-card-hover p-5">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">Évaluations liées</div>
+                  <button
+                    className="sn-btn-ghost sn-press"
+                    onClick={() => navigate("/app/teacher/assessments")}
+                  >
+                    Voir tout
+                  </button>
+                </div>
+
+                {assessments.length === 0 ? (
+                  <div className="mt-4 rounded-2xl border border-gray-100 bg-gray-50 p-4 text-sm text-gray-600">
+                    Aucune évaluation liée à ce cours pour le moment.
+                  </div>
+                ) : (
+                  <div className="mt-4 space-y-3">
+                    {assessments.map((assessment) => (
+                      <div
+                        key={assessment.id}
+                        className="rounded-2xl border border-gray-100 p-4"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="font-semibold text-gray-900">{assessment.title}</div>
+                            <div className="text-sm text-gray-500">{assessment.when}</div>
+                          </div>
+                          <span className={badgeClass(assessment.type)}>{assessment.type}</span>
+                        </div>
+
+                        <div className="mt-3 flex items-center justify-between">
+                          <span
+                            className={
+                              assessment.status === "Publié"
+                                ? "sn-badge sn-badge-green"
+                                : assessment.status === "Clôturé"
+                                ? "sn-badge sn-badge-red"
+                                : "sn-badge sn-badge-gray"
+                            }
+                          >
+                            {assessment.status}
+                          </span>
+
+                          <div className="flex gap-2">
+                            <button
+                              className="sn-btn-ghost sn-press"
+                              type="button"
+                              onClick={() => navigate("/app/teacher/grading")}
+                            >
+                              Corrections
+                            </button>
+                            <button
+                              className="sn-btn-primary sn-press"
+                              type="button"
+                              onClick={() => alert("Ouverture détail évaluation (à venir)")}
+                            >
+                              Ouvrir
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="mt-4">
+                  <button
+                    className="sn-btn-primary w-full sn-press"
+                    onClick={() =>
+                      navigate(`/app/teacher/assessments/new?course=${courseId ?? ""}`)
+                    }
+                  >
+                    + Créer une évaluation
+                  </button>
+                </div>
+              </div>
+
+              <div className="sn-card p-5">
+                <div className="font-semibold">Aperçu</div>
+                <div className="mt-2 text-sm text-gray-500">
+                  Cette zone affichera ensuite :
+                  <ul className="list-disc pl-5 mt-2 space-y-1">
+                    <li>progression moyenne</li>
+                    <li>activité récente</li>
+                    <li>alertes de correction</li>
+                  </ul>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
+        </>
+      )}
     </div>
   );
 }
