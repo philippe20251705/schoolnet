@@ -18,6 +18,23 @@ export type MockAssessment = {
 
 export type AttemptStatus = "in_progress" | "submitted" | "graded" | "published";
 
+export type AttemptQuestion =
+  | {
+      id: string;
+      type: "mcq";
+      prompt: string;
+      points: number;
+      choices: string[];
+      correct?: string;
+    }
+  | {
+      id: string;
+      type: "short";
+      prompt: string;
+      points: number;
+      placeholder?: string;
+    };
+
 export type Attempt = {
   id: string;
   assessmentId: string;
@@ -25,6 +42,9 @@ export type Attempt = {
   submittedAtISO?: string;
   answers: Record<string, string>;
   status: AttemptStatus;
+
+  // ✅ snapshot des questions vues par l'élève au moment de la soumission
+  questions?: AttemptQuestion[];
 
   // Score final (ex "16/20" ou "7/10")
   score?: string;
@@ -60,10 +80,10 @@ export type Student = {
 };
 
 const LS = {
-  seeded: "sn_seeded_v1",
-  assessments: "sn_assessments_v1",
-  attempts: "sn_attempts_v1",
-  students: "sn_students_v1",
+  seeded: "sn_seeded_v2",
+  assessments: "sn_assessments_v2",
+  attempts: "sn_attempts_v2",
+  students: "sn_students_v2",
 };
 
 export function uid(prefix = "id") {
@@ -131,14 +151,42 @@ export function ensureSeed() {
   ];
 
   const attempts: Attempt[] = [
-    // Un exemple déjà soumis pour pouvoir tester la correction direct
     {
       id: uid("attempt"),
       assessmentId: "a2",
       studentId: "demo-student",
       submittedAtISO: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(),
-      answers: { q1: "13", q2: "12", q3: "Une fraction est un nombre écrit sous forme a/b." },
+      answers: {
+        q1: "13",
+        q2: "12",
+        q3: "Une fraction est un nombre écrit sous forme a/b.",
+      },
       status: "submitted",
+      questions: [
+        {
+          id: "q1",
+          type: "mcq",
+          prompt: "Quel est le résultat de 8 + 5 ?",
+          choices: ["11", "12", "13", "14"],
+          points: 2,
+          correct: "13",
+        },
+        {
+          id: "q2",
+          type: "mcq",
+          prompt: "Lequel est un nombre pair ?",
+          choices: ["9", "11", "12", "15"],
+          points: 2,
+          correct: "12",
+        },
+        {
+          id: "q3",
+          type: "short",
+          prompt: "Explique en une phrase ce qu’est une fraction.",
+          placeholder: "Ta réponse...",
+          points: 6,
+        },
+      ],
     },
   ];
 
@@ -201,10 +249,16 @@ export function upsertAttempt(attempt: Attempt) {
   write(LS.attempts, all);
 }
 
+/**
+ * ✅ compat ascendante :
+ * - anciens appels: submitAttempt({ assessmentId, studentId, answers })
+ * - nouveaux appels: submitAttempt({ assessmentId, studentId, answers, questions })
+ */
 export function submitAttempt(params: {
   assessmentId: string;
   studentId: string;
   answers: Record<string, string>;
+  questions?: AttemptQuestion[];
 }) {
   const existing = getAttemptFor(params.assessmentId, params.studentId);
 
@@ -212,6 +266,7 @@ export function submitAttempt(params: {
     ? {
         ...existing,
         answers: params.answers,
+        questions: params.questions ?? existing.questions,
         status: "submitted",
         submittedAtISO: new Date().toISOString(),
       }
@@ -220,6 +275,7 @@ export function submitAttempt(params: {
         assessmentId: params.assessmentId,
         studentId: params.studentId,
         answers: params.answers,
+        questions: params.questions,
         status: "submitted",
         submittedAtISO: new Date().toISOString(),
       };
@@ -232,7 +288,6 @@ export function submitAttempt(params: {
    Grading workflow
 ========================= */
 
-// petite aide pour calculer "x/y"
 export function toScoreLabel(got: number, max: number) {
   const safeMax = Math.max(1, max);
   const safeGot = Math.max(0, Math.min(got, safeMax));
@@ -280,9 +335,12 @@ export function publishAttempt(params: { assessmentId: string; studentId: string
   return next;
 }
 
+// ✅ helper utile pour les vues enseignant / parent mock
+export function getAttemptQuestions(assessmentId: string, studentId: string): AttemptQuestion[] {
+  return getAttemptFor(assessmentId, studentId)?.questions ?? [];
+}
+
 // ✅ compat: utilisé par TeacherAssessments.tsx
 export function updateAssessment(_: any) {
-  // TODO: brancher Supabase plus tard
-  // En démo: on ne fait rien, mais on évite de casser l'app
   return true;
 }

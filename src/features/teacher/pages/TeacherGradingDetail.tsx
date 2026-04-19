@@ -1,48 +1,137 @@
-// src/features/teacher/pages/TeacherGradingDetail.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import {
-  ensureSeed,
-  getAssessmentById,
-  getAttemptsForAssessment,
-  getStudentById,
-  gradeAttempt,
-  publishAttempt,
-  toScoreLabel,
-  type Attempt,
-  type AssessmentType,
-} from "@/lib/mockStore";
-import { getQuestionsForAssessment, type Question } from "@/lib/questionBank";
+import { supabase } from "@/lib/supabaseClient";
+import { useAuth } from "@/lib/auth/AuthProvider";
 
-type PerQuestionDraft = Record<
-  string,
-  {
-    pointsAwarded?: number;
-    comment?: string;
-  }
->;
+type AssessmentType = "quiz" | "assignment" | "exam";
+type SubmissionStatus = "in_progress" | "submitted" | "graded";
 
-type StatusFilter = "all" | Attempt["status"];
+type AssessmentRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  type: AssessmentType;
+  max_score: number | null;
+  course_id: string;
+  section_id: string | null;
+  courses:
+    | {
+        id: string;
+        title: string;
+      }
+    | {
+        id: string;
+        title: string;
+      }[]
+    | null;
+  course_sections:
+    | {
+        id: string;
+        title: string;
+      }
+    | {
+        id: string;
+        title: string;
+      }[]
+    | null;
+};
 
-function badgeTypeClass(type: AssessmentType) {
+type SubmissionRow = {
+  id: string;
+  assessment_id: string;
+  student_id: string;
+  submitted_at: string | null;
+  status: SubmissionStatus;
+  score: number | null;
+  feedback: string | null;
+};
+
+type ProfileRow = {
+  id: string;
+  full_name: string | null;
+};
+
+type QuizQuestionRow = {
+  id: string;
+  assessment_id: string;
+  question_type: "mcq" | "true_false" | "short_text";
+  prompt: string;
+  order_index: number;
+};
+
+type QuizChoiceRow = {
+  id: string;
+  question_id: string;
+  choice_text: string;
+};
+
+type SubmissionAnswerRow = {
+  question_id: string;
+  answer_text: string | null;
+  choice_id: string | null;
+};
+
+type ClassStudentRow = {
+  student_id: string;
+  class_id: string;
+};
+
+type ClassRow = {
+  id: string;
+  name: string;
+  school_year: string;
+};
+
+type QuestionView =
+  | {
+      id: string;
+      type: "mcq";
+      prompt: string;
+      points: number;
+      choices: { id: string; label: string }[];
+      answerLabel: string;
+    }
+  | {
+      id: string;
+      type: "short";
+      prompt: string;
+      points: number;
+      answerLabel: string;
+    };
+
+function normalizeCourse(value: AssessmentRow["courses"]) {
+  if (!value) return null;
+  return Array.isArray(value) ? value[0] ?? null : value;
+}
+
+function normalizeSection(value: AssessmentRow["course_sections"]) {
+  if (!value) return null;
+  return Array.isArray(value) ? value[0] ?? null : value;
+}
+
+function badgeTypeClass(type: "Quiz" | "Devoir" | "Examen") {
   if (type === "Examen") return "sn-badge sn-badge-red";
   if (type === "Devoir") return "sn-badge sn-badge-blue";
   return "sn-badge sn-badge-gray";
 }
 
-function badgeStatus(status?: Attempt["status"]) {
-  if (status === "published") return "sn-badge sn-badge-green";
-  if (status === "graded") return "sn-badge sn-badge-blue";
-  if (status === "submitted") return "sn-badge sn-badge-gray";
-  if (status === "in_progress") return "sn-badge sn-badge-gray";
+function mapType(type: AssessmentType): "Quiz" | "Devoir" | "Examen" {
+  if (type === "assignment") return "Devoir";
+  if (type === "exam") return "Examen";
+  return "Quiz";
+}
+
+function badgeStatus(status?: SubmissionStatus) {
+  if (status === "graded") return "sn-badge sn-badge-green";
+  if (status === "submitted") return "sn-badge sn-badge-blue";
   return "sn-badge sn-badge-gray";
 }
 
-function statusLabel(s: Attempt["status"]) {
+function statusLabel(s?: SubmissionStatus) {
   if (s === "in_progress") return "En cours";
   if (s === "submitted") return "Soumis";
   if (s === "graded") return "Corrigé";
-  return "Publié";
+  return "—";
 }
 
 function safeNumber(v: string) {
@@ -56,24 +145,18 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(n, max));
 }
 
-function formatDateTime(iso?: string) {
+function formatDateTime(iso?: string | null) {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString();
 }
 
-/**
- * Stable stringify (deep) pour comparer les drafts sans faux positifs.
- * - trie les clés récursivement
- * - supporte objets / arrays / primitives
- */
 function stableStringify(value: unknown): string {
   const seen = new WeakSet<object>();
 
   const walk = (v: unknown): unknown => {
     if (v === null || typeof v !== "object") return v;
-
     if (seen.has(v as object)) return "[Circular]";
     seen.add(v as object);
 
@@ -95,137 +178,283 @@ function stableStringify(value: unknown): string {
 
 export default function TeacherGradingDetail() {
   const navigate = useNavigate();
-  const params = useParams<{ id: string }>();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const assessmentId = params.id;
+  const { id } = useParams<{ id: string }>();
+  const [searchParams] = useSearchParams();
+  const { user, loading: authLoading } = useAuth();
 
-  const [refreshKey, setRefreshKey] = useState(0);
+  const studentId = searchParams.get("studentId") || "";
+
+  const [assessment, setAssessment] = useState<AssessmentRow | null>(null);
+  const [submission, setSubmission] = useState<SubmissionRow | null>(null);
+  const [student, setStudent] = useState<ProfileRow | null>(null);
+  const [questions, setQuestions] = useState<QuestionView[]>([]);
+  const [studentClassLabel, setStudentClassLabel] = useState("Classe non assignée");
+
+  const [score, setScore] = useState("");
+  const [feedback, setFeedback] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const initialDraftRef = useRef("");
+
+  const loadDetail = useCallback(async () => {
+    if (!id) {
+      setError("Évaluation introuvable.");
+      setLoading(false);
+      return;
+    }
+
+    if (!studentId) {
+      setError("Élève introuvable.");
+      setLoading(false);
+      return;
+    }
+
+    if (!user || user.isDemo) {
+      setError("La correction réelle n’est pas disponible en mode démo.");
+      setLoading(false);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      const [assessmentResult, submissionResult, studentResult] = await Promise.all([
+        supabase
+          .from("assessments")
+          .select(
+            `
+            id,
+            title,
+            description,
+            type,
+            max_score,
+            course_id,
+            section_id,
+            courses (
+              id,
+              title
+            ),
+            course_sections (
+              id,
+              title
+            )
+          `
+          )
+          .eq("id", id)
+          .single(),
+
+        supabase
+          .from("submissions")
+          .select("id, assessment_id, student_id, submitted_at, status, score, feedback")
+          .eq("assessment_id", id)
+          .eq("student_id", studentId)
+          .maybeSingle(),
+
+        supabase
+          .from("profiles")
+          .select("id, full_name")
+          .eq("id", studentId)
+          .maybeSingle(),
+      ]);
+
+      if (assessmentResult.error) throw assessmentResult.error;
+      if (submissionResult.error) throw submissionResult.error;
+      if (studentResult.error) throw studentResult.error;
+
+      const assessmentData = assessmentResult.data as AssessmentRow;
+      const submissionData = submissionResult.data as SubmissionRow | null;
+      const studentData = studentResult.data as ProfileRow | null;
+
+      if (!submissionData) {
+        setError("Aucune soumission trouvée pour cet élève.");
+        setAssessment(assessmentData);
+        setStudent(studentData);
+        setSubmission(null);
+        setQuestions([]);
+        setStudentClassLabel("Classe non assignée");
+        return;
+      }
+
+      const { data: classStudentsData, error: classStudentsError } = await supabase
+        .from("class_students")
+        .select("student_id, class_id")
+        .eq("student_id", studentId);
+
+      if (classStudentsError) throw classStudentsError;
+
+      const classStudents = (classStudentsData ?? []) as ClassStudentRow[];
+      const classIds = Array.from(new Set(classStudents.map((row) => row.class_id)));
+
+      let computedClassLabel = "Classe non assignée";
+
+      if (classIds.length > 0) {
+        const { data: classesData, error: classesError } = await supabase
+          .from("classes")
+          .select("id, name, school_year")
+          .in("id", classIds);
+
+        if (classesError) throw classesError;
+
+        const classes = (classesData ?? []) as ClassRow[];
+        const firstClass = classes[0];
+        if (firstClass) {
+          computedClassLabel = `${firstClass.name} (${firstClass.school_year})`;
+        }
+      }
+
+      const { data: questionRowsData, error: questionsError } = await supabase
+        .from("quiz_questions")
+        .select("id, assessment_id, question_type, prompt, order_index")
+        .eq("assessment_id", id)
+        .order("order_index", { ascending: true });
+
+      if (questionsError) throw questionsError;
+
+      const questionRows = (questionRowsData ?? []) as QuizQuestionRow[];
+      const questionIds = questionRows.map((q) => q.id);
+
+      let choiceRows: QuizChoiceRow[] = [];
+      if (questionIds.length > 0) {
+        const { data: choiceRowsData, error: choicesError } = await supabase
+          .from("quiz_choices")
+          .select("id, question_id, choice_text")
+          .in("question_id", questionIds);
+
+        if (choicesError) throw choicesError;
+
+        choiceRows = (choiceRowsData ?? []) as QuizChoiceRow[];
+      }
+
+      const { data: answerRowsData, error: answersError } = await supabase
+        .from("submission_answers")
+        .select("question_id, answer_text, choice_id")
+        .eq("submission_id", submissionData.id);
+
+      if (answersError) throw answersError;
+
+      const answerRows = (answerRowsData ?? []) as SubmissionAnswerRow[];
+
+      const answerByQuestionId = answerRows.reduce<Record<string, SubmissionAnswerRow>>((acc, row) => {
+        acc[row.question_id] = row;
+        return acc;
+      }, {});
+
+      const mappedQuestions: QuestionView[] =
+        questionRows.length > 0
+          ? questionRows.map((q) => {
+              const answer = answerByQuestionId[q.id];
+              const points =
+                assessmentData.max_score && questionRows.length > 0
+                  ? Math.max(1, Math.round(assessmentData.max_score / questionRows.length))
+                  : 1;
+
+              if (q.question_type === "mcq" || q.question_type === "true_false") {
+                const fallbackChoices =
+                  q.question_type === "true_false"
+                    ? [
+                        { id: `${q.id}-true`, label: "Vrai" },
+                        { id: `${q.id}-false`, label: "Faux" },
+                      ]
+                    : [];
+
+                const choices =
+                  q.question_type === "true_false"
+                    ? fallbackChoices
+                    : choiceRows
+                        .filter((choice) => choice.question_id === q.id)
+                        .map((choice) => ({
+                          id: choice.id,
+                          label: choice.choice_text,
+                        }));
+
+                const answerLabel =
+                  q.question_type === "true_false"
+                    ? answer?.answer_text || "Aucune réponse."
+                    : choices.find((c) => c.id === answer?.choice_id)?.label || "Aucune réponse.";
+
+                return {
+                  id: q.id,
+                  type: "mcq" as const,
+                  prompt: q.prompt,
+                  points,
+                  choices,
+                  answerLabel,
+                };
+              }
+
+              return {
+                id: q.id,
+                type: "short" as const,
+                prompt: q.prompt,
+                points,
+                answerLabel: answer?.answer_text || "Aucune réponse.",
+              };
+            })
+          : [
+              {
+                id: "fallback-display",
+                type: "short" as const,
+                prompt:
+                  assessmentData.description?.trim() ||
+                  "Cette évaluation ne contient pas encore de questions détaillées.",
+                points: assessmentData.max_score ?? 20,
+                answerLabel:
+                  submissionData.feedback?.trim() ||
+                  "Soumission enregistrée sans réponses détaillées.",
+              },
+            ];
+
+      setAssessment(assessmentData);
+      setSubmission(submissionData);
+      setStudent(studentData);
+      setQuestions(mappedQuestions);
+      setStudentClassLabel(computedClassLabel);
+
+      const nextScore =
+        submissionData.score !== null && submissionData.score !== undefined
+          ? String(submissionData.score)
+          : "";
+
+      const nextFeedback = submissionData.feedback ?? "";
+
+      setScore(nextScore);
+      setFeedback(nextFeedback);
+
+      initialDraftRef.current = stableStringify({
+        score: nextScore,
+        feedback: nextFeedback.trim(),
+      });
+    } catch (err) {
+      console.error("[TeacherGradingDetail] loadDetail error:", err);
+      setError("Impossible de charger le détail de la copie.");
+      setAssessment(null);
+      setSubmission(null);
+      setStudent(null);
+      setQuestions([]);
+      setStudentClassLabel("Classe non assignée");
+    } finally {
+      setLoading(false);
+    }
+  }, [id, studentId, user]);
 
   useEffect(() => {
-    ensureSeed();
-  }, []);
-
-  const assessment = useMemo(() => {
-    if (!assessmentId) return null;
-    return getAssessmentById(assessmentId);
-  }, [assessmentId, refreshKey]);
-
-  const questions: Question[] = useMemo(() => {
-    if (!assessmentId) return [];
-    return getQuestionsForAssessment(assessmentId, assessment?.type);
-  }, [assessmentId, assessment?.type]);
-
-  const allAttempts = useMemo(() => {
-    if (!assessmentId) return [];
-    const all = getAttemptsForAssessment(assessmentId);
-
-    // tri : in_progress → submitted → graded → published, puis plus récent
-    const order = (s: Attempt["status"]) =>
-      s === "in_progress" ? 0 : s === "submitted" ? 1 : s === "graded" ? 2 : s === "published" ? 3 : 9;
-
-    return [...all].sort((a, b) => {
-      const oa = order(a.status);
-      const ob = order(b.status);
-      if (oa !== ob) return oa - ob;
-
-      const ta = a.submittedAtISO ? new Date(a.submittedAtISO).getTime() : 0;
-      const tb = b.submittedAtISO ? new Date(b.submittedAtISO).getTime() : 0;
-      return tb - ta;
-    });
-  }, [assessmentId, refreshKey]);
-
-  const studentsById = useMemo(() => {
-    const map: Record<string, ReturnType<typeof getStudentById>> = {};
-    for (const a of allAttempts) {
-      if (!map[a.studentId]) map[a.studentId] = getStudentById(a.studentId);
-    }
-    return map;
-  }, [allAttempts]);
-
-  // UI filters
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [query, setQuery] = useState("");
-
-  const attempts = useMemo(() => {
-    const q = query.trim().toLowerCase();
-
-    return allAttempts.filter((a) => {
-      if (statusFilter !== "all" && a.status !== statusFilter) return false;
-      if (!q) return true;
-
-      const s = studentsById[a.studentId];
-      const name = (s?.name || a.studentId).toLowerCase();
-      return name.includes(q);
-    });
-  }, [allAttempts, statusFilter, query, studentsById]);
-
-  const counts = useMemo(() => {
-    const c: Record<Attempt["status"], number> = {
-      in_progress: 0,
-      submitted: 0,
-      graded: 0,
-      published: 0,
-    };
-    for (const a of allAttempts) c[a.status] += 1;
-    return c;
-  }, [allAttempts]);
-
-  // selection
-  const selectedStudentId = searchParams.get("studentId") || undefined;
-
-  const selectedAttempt = useMemo(() => {
-    if (!allAttempts.length) return null;
-    if (selectedStudentId) {
-      const found = allAttempts.find((a) => a.studentId === selectedStudentId);
-      if (found) return found;
-    }
-    return allAttempts[0];
-  }, [allAttempts, selectedStudentId]);
-
-  const student = useMemo(() => {
-    if (!selectedAttempt) return null;
-    return studentsById[selectedAttempt.studentId] || getStudentById(selectedAttempt.studentId);
-  }, [selectedAttempt?.studentId, studentsById]);
-
-  // Draft local
-  const [overallComment, setOverallComment] = useState("");
-  const [perQuestion, setPerQuestion] = useState<PerQuestionDraft>({});
-  const [saving, setSaving] = useState(false);
-  const [publishing, setPublishing] = useState(false);
-
-  const initialDraftRef = useRef<string>("");
-
-  const draftFingerprint = useMemo(() => {
-    return stableStringify({
-      overallComment: overallComment.trim(),
-      perQuestion,
-    });
-  }, [overallComment, perQuestion]);
+    if (authLoading) return;
+    void loadDetail();
+  }, [authLoading, loadDetail]);
 
   const hasUnsaved = useMemo(() => {
     if (!initialDraftRef.current) return false;
-    return draftFingerprint !== initialDraftRef.current;
-  }, [draftFingerprint]);
-
-  // charger draft quand on change de copie
-  useEffect(() => {
-    if (!selectedAttempt) return;
-
-    const nextOverall = selectedAttempt.grading?.overallComment || "";
-    const nextPQ = (selectedAttempt.grading?.perQuestion || {}) as PerQuestionDraft;
-
-    setOverallComment(nextOverall);
-    setPerQuestion(nextPQ);
-    setSaving(false);
-    setPublishing(false);
-
-    initialDraftRef.current = stableStringify({
-      overallComment: nextOverall.trim(),
-      perQuestion: nextPQ,
+    const current = stableStringify({
+      score: score.trim(),
+      feedback: feedback.trim(),
     });
-  }, [selectedAttempt?.id, refreshKey]);
+    return current !== initialDraftRef.current;
+  }, [score, feedback]);
 
-  // warn before leaving tab if unsaved
   useEffect(() => {
     const handler = (e: BeforeUnloadEvent) => {
       if (!hasUnsaved) return;
@@ -236,169 +465,75 @@ export default function TeacherGradingDetail() {
     return () => window.removeEventListener("beforeunload", handler);
   }, [hasUnsaved]);
 
-  const answers = (selectedAttempt?.answers || {}) as Record<string, string>;
-
-  const totalMaxPoints = useMemo(() => questions.reduce((acc, q) => acc + q.points, 0), [questions]);
-
-  const totalAwarded = useMemo(() => {
-    return questions.reduce((acc, q) => {
-      const got = perQuestion[q.id]?.pointsAwarded;
-      if (typeof got !== "number") return acc;
-      return acc + clamp(got, 0, q.points);
-    }, 0);
-  }, [questions, perQuestion]);
-
-  const finalScoreLabel = useMemo(() => toScoreLabel(totalAwarded, totalMaxPoints), [totalAwarded, totalMaxPoints]);
-
-  // Locking rules
-  const isPublished = selectedAttempt?.status === "published";
-  const isLocked = Boolean(isPublished); // ✅ on verrouille si publié (mode parent/élève)
-  const canGrade = Boolean(assessment && assessmentId && selectedAttempt) && !isLocked;
-  const canPublish = Boolean(selectedAttempt && selectedAttempt.status !== "published");
-
-  // timeline info
-  const gradedAt = selectedAttempt?.grading?.gradedAtISO;
-  const publishedAt = selectedAttempt?.grading?.publishedAtISO;
-
-  const selectAttempt = useCallback(
-    (studentId: string) => {
-      if (hasUnsaved && !isLocked) {
-        const ok = window.confirm("Tu as des modifications non enregistrées. Continuer et les perdre ?");
-        if (!ok) return;
-      }
-
-      setSearchParams((prev) => {
-        const next = new URLSearchParams(prev);
-        next.set("studentId", studentId);
-        return next;
-      });
-    },
-    [hasUnsaved, isLocked, setSearchParams]
-  );
-
-  const setPoints = useCallback((qid: string, raw: string, maxPoints: number) => {
-    const n = raw === "" ? undefined : safeNumber(raw);
-    setPerQuestion((prev) => ({
-      ...prev,
-      [qid]: {
-        ...(prev[qid] || {}),
-        pointsAwarded: typeof n === "number" ? clamp(n, 0, maxPoints) : undefined,
-      },
-    }));
-  }, []);
-
-  const setComment = useCallback((qid: string, comment: string) => {
-    setPerQuestion((prev) => ({
-      ...prev,
-      [qid]: {
-        ...(prev[qid] || {}),
-        comment,
-      },
-    }));
-  }, []);
-
-  const autofillMCQ = useCallback(() => {
-    if (!selectedAttempt) return;
-    if (isLocked) return;
-
-    setPerQuestion((prev) => {
-      const next = { ...prev };
-      for (const q of questions) {
-        if (q.type !== "mcq" || !q.correct) continue;
-        const a = (answers[q.id] || "").trim();
-        if (!a) continue;
-        const got = a === q.correct ? q.points : 0;
-        next[q.id] = { ...(next[q.id] || {}), pointsAwarded: got };
-      }
-      return next;
-    });
-  }, [answers, questions, selectedAttempt, isLocked]);
+  const maxScore = assessment?.max_score ?? 20;
+  const scoreNumber = useMemo(() => {
+    const parsed = safeNumber(score);
+    return typeof parsed === "number" ? clamp(parsed, 0, maxScore) : undefined;
+  }, [score, maxScore]);
 
   async function onSaveGrade() {
-    if (!assessmentId || !selectedAttempt) return;
-    if (saving || publishing) return;
-    if (isLocked) return;
+    if (!submission) return;
+    if (saving) return;
 
-    setSaving(true);
     try {
-      const clamped: PerQuestionDraft = {};
-      for (const q of questions) {
-        const got = perQuestion[q.id]?.pointsAwarded;
-        const safe = typeof got === "number" ? clamp(got, 0, q.points) : undefined;
+      setSaving(true);
 
-        clamped[q.id] = {
-          comment: perQuestion[q.id]?.comment?.trim() || undefined,
-          pointsAwarded: safe,
-        };
-      }
+      const updatePayload: {
+        score?: number | null;
+        feedback?: string | null;
+        status?: SubmissionStatus;
+      } = {
+        feedback: feedback.trim() || null,
+        status: "graded",
+      };
 
-      const next = gradeAttempt({
-        assessmentId,
-        studentId: selectedAttempt.studentId,
-        grading: {
-          overallComment: overallComment.trim() || undefined,
-          perQuestion: clamped,
-          finalScore: finalScoreLabel,
-        },
-      });
+      updatePayload.score =
+        typeof scoreNumber === "number" ? scoreNumber : null;
 
-      if (!next) {
-        alert("Impossible d’enregistrer la correction (démo).");
-        return;
-      }
+      const { error: updateError } = await supabase
+        .from("submissions")
+        .update(updatePayload)
+        .eq("id", submission.id);
 
-      setRefreshKey((k) => k + 1);
+      if (updateError) throw updateError;
 
       initialDraftRef.current = stableStringify({
-        overallComment: (overallComment || "").trim(),
-        perQuestion: clamped,
+        score: score.trim(),
+        feedback: feedback.trim(),
       });
 
+      await loadDetail();
       alert("✅ Correction enregistrée.");
-      setSearchParams((prev) => {
-        const p = new URLSearchParams(prev);
-        p.set("studentId", selectedAttempt.studentId);
-        return p;
-      });
+    } catch (err: any) {
+      console.error("[TeacherGradingDetail] onSaveGrade error:", err);
+
+      const message =
+        err?.message ||
+        err?.error_description ||
+        err?.details ||
+        "Impossible d’enregistrer la correction.";
+
+      alert(message);
     } finally {
       setSaving(false);
     }
   }
 
-  async function onPublish() {
-    if (!assessmentId || !selectedAttempt) return;
-    if (saving || publishing) return;
-    if (selectedAttempt.status === "published") return;
+  const assessmentType = assessment ? mapType(assessment.type) : "Quiz";
+  const courseTitle = assessment ? normalizeCourse(assessment.courses)?.title ?? "Cours" : "Cours";
+  const sectionTitle = assessment
+    ? normalizeSection(assessment.course_sections)?.title ?? "Sans section"
+    : "Sans section";
 
-    setPublishing(true);
-    try {
-      // ✅ si c'est "submitted", on enregistre d’abord
-      if (selectedAttempt.status === "submitted") {
-        await onSaveGrade();
-      }
+  const studentDisplayName = student?.full_name?.trim() || "Élève";
 
-      const next = publishAttempt({
-        assessmentId,
-        studentId: selectedAttempt.studentId,
-      });
+  const isLoading = authLoading || loading;
 
-      if (!next) {
-        alert("Impossible de publier (démo).");
-        return;
-      }
-
-      setRefreshKey((k) => k + 1);
-      alert("📣 Publié ! Visible côté élève/parent.");
-    } finally {
-      setPublishing(false);
-    }
-  }
-
-  if (!assessmentId || !assessment) {
+  if (!id) {
     return (
       <div className="sn-card p-6 space-y-3">
         <div className="text-lg font-semibold">Correction</div>
-        <div className="text-sm text-gray-500">Évaluation introuvable (id: {assessmentId || "—"}).</div>
+        <div className="text-sm text-gray-500">Évaluation introuvable.</div>
         <button className="sn-btn-primary sn-press w-fit" onClick={() => navigate("/app/teacher/grading")}>
           ← Retour
         </button>
@@ -408,21 +543,17 @@ export default function TeacherGradingDetail() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="text-xl font-semibold">Correction</div>
           <div className="text-sm text-gray-500">
-            <span className={badgeTypeClass(assessment.type)}>{assessment.type}</span>{" "}
-            <span className="ml-2">{assessment.title}</span> • {assessment.className} • {assessment.sectionTitle}
+            <span className={badgeTypeClass(assessmentType)}>{assessmentType}</span>
+            <span className="ml-2">{assessment?.title ?? "Évaluation"}</span> • {courseTitle} • {sectionTitle}
           </div>
 
-          {/* Timeline */}
-          {selectedAttempt && (
+          {submission && (
             <div className="mt-2 text-xs text-gray-500">
-              {selectedAttempt.submittedAtISO ? <>Soumis : {formatDateTime(selectedAttempt.submittedAtISO)} • </> : null}
-              {gradedAt ? <>Corrigé : {formatDateTime(gradedAt)} • </> : null}
-              {publishedAt ? <>Publié : {formatDateTime(publishedAt)}</> : null}
+              Soumis : {formatDateTime(submission.submitted_at)}
             </div>
           )}
         </div>
@@ -430,7 +561,7 @@ export default function TeacherGradingDetail() {
         <button
           className="sn-btn-ghost sn-press"
           onClick={() => {
-            if (hasUnsaved && !isLocked) {
+            if (hasUnsaved) {
               const ok = window.confirm("Tu as des modifications non enregistrées. Quitter quand même ?");
               if (!ok) return;
             }
@@ -441,274 +572,139 @@ export default function TeacherGradingDetail() {
         </button>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        {/* LEFT */}
-        <div className="sn-card p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <div className="font-semibold">Copies</div>
-            <span className="sn-badge sn-badge-gray">{allAttempts.length}</span>
+      {isLoading && (
+        <div className="grid gap-4 lg:grid-cols-3">
+          <div className="sn-card p-4 space-y-3 animate-pulse">
+            <div className="h-5 w-1/2 rounded bg-gray-200" />
+            <div className="h-16 rounded bg-gray-100" />
           </div>
-
-          {/* filters */}
-          <div className="grid gap-2">
-            <input
-              className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-200"
-              placeholder="Rechercher un élève…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-
-            <div className="flex flex-wrap gap-2">
-              <button
-                className={`sn-btn-ghost sn-press ${statusFilter === "all" ? "ring-2 ring-blue-200" : ""}`}
-                onClick={() => setStatusFilter("all")}
-                type="button"
-              >
-                Tous
-              </button>
-
-              <button
-                className={`sn-btn-ghost sn-press ${statusFilter === "submitted" ? "ring-2 ring-blue-200" : ""}`}
-                onClick={() => setStatusFilter("submitted")}
-                type="button"
-              >
-                Soumis ({counts.submitted})
-              </button>
-
-              <button
-                className={`sn-btn-ghost sn-press ${statusFilter === "graded" ? "ring-2 ring-blue-200" : ""}`}
-                onClick={() => setStatusFilter("graded")}
-                type="button"
-              >
-                Corrigé ({counts.graded})
-              </button>
-
-              <button
-                className={`sn-btn-ghost sn-press ${statusFilter === "published" ? "ring-2 ring-blue-200" : ""}`}
-                onClick={() => setStatusFilter("published")}
-                type="button"
-              >
-                Publié ({counts.published})
-              </button>
-            </div>
+          <div className="lg:col-span-2 sn-card p-5 space-y-4 animate-pulse">
+            <div className="h-5 w-1/3 rounded bg-gray-200" />
+            <div className="h-20 rounded bg-gray-100" />
+            <div className="h-20 rounded bg-gray-100" />
           </div>
-
-          {attempts.length === 0 ? (
-            <div className="text-sm text-gray-500">Aucune copie (selon filtre).</div>
-          ) : (
-            <div className="space-y-2">
-              {attempts.map((a) => {
-                const s = studentsById[a.studentId];
-                const active = selectedAttempt?.id === a.id;
-
-                return (
-                  <button
-                    key={a.id}
-                    type="button"
-                    onClick={() => selectAttempt(a.studentId)}
-                    className={[
-                      "w-full text-left rounded-2xl border p-3 sn-press transition",
-                      active ? "border-blue-600 bg-blue-50" : "border-gray-100 bg-white hover:bg-gray-50",
-                    ].join(" ")}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="font-semibold text-gray-900 truncate">{s?.name || a.studentId}</div>
-                        <div className="text-xs text-gray-500">
-                          {a.submittedAtISO ? new Date(a.submittedAtISO).toLocaleString() : "—"}
-                        </div>
-                      </div>
-                      <span className={badgeStatus(a.status)}>{statusLabel(a.status)}</span>
-                    </div>
-
-                    {a.score && (
-                      <div className="mt-2 text-xs text-gray-700">
-                        Score: <span className="font-semibold">{a.score}</span>
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-          )}
         </div>
+      )}
 
-        {/* RIGHT */}
-        <div className="lg:col-span-2 space-y-4">
-          {!selectedAttempt ? (
-            <div className="sn-card p-6 text-sm text-gray-500">Sélectionne une copie à corriger.</div>
-          ) : (
-            <>
-              {/* summary */}
-              <div className="sn-card p-5 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="font-semibold text-gray-900">{student?.name || selectedAttempt.studentId}</div>
+      {!isLoading && error && (
+        <div className="sn-card p-4 bg-red-50 border border-red-200 text-red-700">
+          {error}
+        </div>
+      )}
 
-                    <div className="text-sm text-gray-500">
-                      Statut :{" "}
-                      <span className={badgeStatus(selectedAttempt.status)}>{statusLabel(selectedAttempt.status)}</span>
+      {!isLoading && !error && submission && (
+        <div className="grid gap-4 lg:grid-cols-3">
+          <div className="sn-card p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="font-semibold">Copie</div>
+              <span className={badgeStatus(submission.status)}>{statusLabel(submission.status)}</span>
+            </div>
 
-                      {isLocked && <span className="ml-2 sn-badge sn-badge-green">Verrouillé (publié)</span>}
+            <div className="text-sm text-gray-700">
+              <div className="font-semibold text-gray-900">{studentDisplayName}</div>
+              <div className="text-xs text-gray-500 mt-1">{studentClassLabel}</div>
+            </div>
 
-                      {hasUnsaved && !isLocked && (
-                        <span className="ml-2 sn-badge sn-badge-gray">Modifs non enregistrées</span>
+            <div className="rounded-2xl border border-gray-100 bg-white p-4 space-y-3">
+              <div className="text-sm font-semibold text-gray-900">Notation</div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-gray-700">Score global</label>
+                <input
+                  className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+                  inputMode="decimal"
+                  placeholder={`0 - ${maxScore}`}
+                  value={score}
+                  onChange={(e) => setScore(e.target.value)}
+                  disabled={saving}
+                />
+                <div className="text-xs text-gray-500">Maximum : {maxScore} pts</div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-gray-700">Feedback global</label>
+                <textarea
+                  className="w-full min-h-[140px] rounded-2xl border border-gray-200 bg-white p-3 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+                  placeholder="Commentaire global pour l’élève..."
+                  value={feedback}
+                  onChange={(e) => setFeedback(e.target.value)}
+                  disabled={saving}
+                />
+              </div>
+
+              <button
+                className="sn-btn-primary sn-press w-full"
+                onClick={onSaveGrade}
+                disabled={saving}
+              >
+                {saving ? "Enregistrement..." : "Enregistrer correction"}
+              </button>
+            </div>
+
+            <div className="text-xs text-gray-500">
+              *Cette version enregistre une note globale et un feedback global dans Supabase.*
+            </div>
+          </div>
+
+          <div className="lg:col-span-2 space-y-4">
+            <div className="sn-card p-5 space-y-4">
+              <div className="font-semibold">Réponses de l’élève</div>
+
+              {questions.length === 0 ? (
+                <div className="text-sm text-gray-500">Aucune réponse détaillée disponible.</div>
+              ) : (
+                <div className="space-y-4">
+                  {questions.map((question, idx) => (
+                    <div
+                      key={question.id}
+                      className="rounded-2xl border border-gray-100 p-4 space-y-3"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-xs text-gray-500">
+                            Question {idx + 1} • {question.points} pts
+                          </div>
+                          <div className="font-semibold text-gray-900">{question.prompt}</div>
+                        </div>
+                        <span className="sn-badge sn-badge-gray">
+                          {question.type === "mcq" ? "QCM" : "Réponse ouverte"}
+                        </span>
+                      </div>
+
+                      {question.type === "mcq" ? (
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {question.choices.map((choice) => {
+                            const isChosen = question.answerLabel === choice.label;
+                            return (
+                              <div
+                                key={choice.id}
+                                className={`rounded-2xl border p-3 text-left ${
+                                  isChosen
+                                    ? "border-blue-600 bg-blue-50"
+                                    : "border-gray-100 bg-white"
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="text-sm text-gray-900">{choice.label}</div>
+                                  {isChosen && <span className="sn-badge sn-badge-blue">Choisi</span>}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="rounded-2xl bg-gray-50 border border-gray-100 p-3 text-sm text-gray-800">
+                          {question.answerLabel}
+                        </div>
                       )}
                     </div>
-                  </div>
-
-                  <div className="text-right">
-                    <div className="text-xs text-gray-500">{isLocked ? "Score (enregistré)" : "Score (prévisualisation)"}</div>
-                    <div className="text-2xl font-bold text-gray-900">
-                      {selectedAttempt.grading?.finalScore || selectedAttempt.score || finalScoreLabel}
-                    </div>
-                    <div className="text-xs text-gray-500">
-                      {totalAwarded} / {totalMaxPoints} pts
-                    </div>
-                  </div>
+                  ))}
                 </div>
-
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    className="sn-btn-ghost sn-press"
-                    type="button"
-                    onClick={autofillMCQ}
-                    disabled={!canGrade || saving || publishing}
-                    title={isLocked ? "Copie publiée : édition verrouillée" : "Auto-note les QCM (bonne réponse = points max, sinon 0)"}
-                  >
-                    ⚡ Auto QCM
-                  </button>
-
-                  <button
-                    className="sn-btn-primary sn-press"
-                    onClick={onSaveGrade}
-                    disabled={!canGrade || saving || publishing}
-                    title={isLocked ? "Copie publiée : édition verrouillée" : undefined}
-                  >
-                    {saving ? "Enregistrement..." : "Enregistrer correction"}
-                  </button>
-
-                  <button
-                    className="sn-btn-ghost sn-press"
-                    onClick={onPublish}
-                    disabled={!canPublish || saving || publishing}
-                    title={selectedAttempt.status === "published" ? "Déjà publié" : "Publier la correction"}
-                  >
-                    {selectedAttempt.status === "published"
-                      ? "Déjà publié"
-                      : publishing
-                      ? "Publication..."
-                      : "Publier"}
-                  </button>
-                </div>
-
-                <div className="rounded-2xl border border-gray-100 bg-white p-4 space-y-2">
-                  <div className="text-sm font-semibold text-gray-900">Commentaire global</div>
-                  <textarea
-                    className="w-full min-h-[110px] rounded-2xl border border-gray-200 bg-white p-3 text-sm outline-none focus:ring-2 focus:ring-blue-200"
-                    placeholder="Ex: Bon travail, mais attention à..."
-                    value={overallComment}
-                    onChange={(e) => setOverallComment(e.target.value)}
-                    disabled={isLocked || saving || publishing}
-                  />
-                  <div className="text-xs text-gray-500">
-                    {isLocked ? "Déjà publié : modification verrouillée." : "Visible côté élève/parent après publication."}
-                  </div>
-                </div>
-              </div>
-
-              {/* per question */}
-              <div className="sn-card p-5 space-y-4">
-                <div className="font-semibold">Correction par question</div>
-
-                <div className="space-y-4">
-                  {questions.map((q, idx) => {
-                    const a = (answers[q.id] || "").trim();
-                    const got = perQuestion[q.id]?.pointsAwarded;
-                    const comment = perQuestion[q.id]?.comment || "";
-
-                    return (
-                      <div key={q.id} className="rounded-2xl border border-gray-100 p-4 space-y-3">
-                        <div className="flex flex-wrap items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="text-xs text-gray-500">
-                              Question {idx + 1} • {q.points} pts • {q.type === "mcq" ? "QCM" : "Réponse ouverte"}
-                            </div>
-                            <div className="font-semibold text-gray-900">{q.prompt}</div>
-                          </div>
-
-                          <div className="flex items-center gap-2">
-                            <div className="text-xs text-gray-500">Points</div>
-                            <input
-                              className="w-20 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-200"
-                              inputMode="decimal"
-                              placeholder={`0-${q.points}`}
-                              value={typeof got === "number" ? String(got) : ""}
-                              onChange={(e) => setPoints(q.id, e.target.value, q.points)}
-                              disabled={isLocked || saving || publishing}
-                            />
-                            <span className="text-xs text-gray-500">/ {q.points}</span>
-                          </div>
-                        </div>
-
-                        {q.type === "mcq" ? (
-                          <div className="grid gap-2 sm:grid-cols-2">
-                            {q.choices.map((c) => {
-                              const selected = a === c;
-                              const correct = q.correct && c === q.correct;
-
-                              const base = "rounded-2xl border p-3 text-left";
-                              const cls =
-                                selected && correct
-                                  ? "border-green-500 bg-green-50"
-                                  : selected && !correct
-                                  ? "border-red-300 bg-red-50"
-                                  : !selected && correct
-                                  ? "border-green-200 bg-green-50/40"
-                                  : "border-gray-100 bg-white";
-
-                              return (
-                                <div key={c} className={`${base} ${cls}`}>
-                                  <div className="flex items-center justify-between gap-3">
-                                    <div className="text-sm text-gray-900">{c}</div>
-                                    <div className="flex gap-2">
-                                      {correct && <span className="sn-badge sn-badge-green">Bonne</span>}
-                                      {selected && <span className="sn-badge sn-badge-blue">Choisi</span>}
-                                    </div>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        ) : (
-                          <div className="rounded-2xl bg-gray-50 border border-gray-100 p-3 text-sm text-gray-800">
-                            {a ? a : <span className="text-gray-500">Aucune réponse.</span>}
-                          </div>
-                        )}
-
-                        <div className="space-y-2">
-                          <div className="text-xs font-semibold text-gray-700">Commentaire enseignant</div>
-                          <textarea
-                            className="w-full min-h-[90px] rounded-2xl border border-gray-200 bg-white p-3 text-sm outline-none focus:ring-2 focus:ring-blue-200"
-                            placeholder="Ex: Bonne méthode, mais..."
-                            value={comment}
-                            onChange={(e) => setComment(q.id, e.target.value)}
-                            disabled={isLocked || saving || publishing}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div className="text-xs text-gray-500">
-                  *Démo : Enregistrer = Corrigé. Publier = visible élève/parent. Une fois publié, la copie est verrouillée.*
-                </div>
-              </div>
-            </>
-          )}
+              )}
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

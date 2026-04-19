@@ -68,6 +68,7 @@ type Question =
       prompt: string;
       points: number;
       choices: { id: string; label: string }[];
+      isFallback?: false;
     }
   | {
       id: string;
@@ -75,6 +76,7 @@ type Question =
       prompt: string;
       points: number;
       placeholder?: string;
+      isFallback?: boolean;
     };
 
 function normalizeCourse(value: AssessmentRow["courses"]) {
@@ -260,6 +262,7 @@ export default function StudentAssessmentTake() {
                   prompt: q.prompt,
                   points,
                   choices,
+                  isFallback: false,
                 };
               }
 
@@ -269,6 +272,7 @@ export default function StudentAssessmentTake() {
                 prompt: q.prompt,
                 points,
                 placeholder: "Votre réponse...",
+                isFallback: false,
               };
             })
           : [
@@ -280,6 +284,7 @@ export default function StudentAssessmentTake() {
                   "Répondez aux consignes de cette évaluation.",
                 points: assessmentRow.max_score ?? 20,
                 placeholder: "Votre réponse...",
+                isFallback: true,
               },
             ];
 
@@ -436,6 +441,8 @@ export default function StudentAssessmentTake() {
 
         if (deleteAnswersError) throw deleteAnswersError;
 
+        const realQuestions = questions.filter((q) => !q.isFallback);
+
         const payload: {
           submission_id: string;
           question_id: string;
@@ -443,7 +450,7 @@ export default function StudentAssessmentTake() {
           choice_id: string | null;
         }[] = [];
 
-        for (const q of questions) {
+        for (const q of realQuestions) {
           const raw = (answers[q.id] || "").trim();
           if (!raw) continue;
 
@@ -489,10 +496,10 @@ export default function StudentAssessmentTake() {
         console.error("[StudentAssessmentTake] submit error:", err);
 
         const message =
-        err?.message ||
-        err?.error_description ||
-        err?.details ||
-        "Impossible de soumettre l’évaluation.";
+          err?.message ||
+          err?.error_description ||
+          err?.details ||
+          "Impossible de soumettre l’évaluation.";
 
         setError(message);
       } finally {
@@ -754,7 +761,7 @@ export default function StudentAssessmentTake() {
                 </div>
               </div>
             </div>
-          </div>                                    
+          </div>
         </>
       )}
     </div>
