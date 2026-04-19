@@ -1,202 +1,346 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import {
-  ensureSeed,
-  getAssessmentById,
-  getAttemptFor,
-  submitAttempt,
-  type AssessmentType,
-} from "@/lib/mockStore";
+import { supabase } from "@/lib/supabaseClient";
+import { useAuth } from "@/lib/auth/AuthProvider";
+
+type AssessmentType = "quiz" | "assignment" | "exam";
+
+type AssessmentRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  type: AssessmentType;
+  course_id: string;
+  section_id: string | null;
+  time_limit_minutes: number | null;
+  max_score: number | null;
+  courses:
+    | {
+        id: string;
+        title: string;
+      }
+    | {
+        id: string;
+        title: string;
+      }[]
+    | null;
+  course_sections:
+    | {
+        id: string;
+        title: string;
+      }
+    | {
+        id: string;
+        title: string;
+      }[]
+    | null;
+};
+
+type QuizQuestionRow = {
+  id: string;
+  assessment_id: string;
+  question_type: "mcq" | "true_false" | "short_text";
+  prompt: string;
+  order_index: number;
+};
+
+type QuizChoiceRow = {
+  id: string;
+  question_id: string;
+  choice_text: string;
+};
+
+type ExistingSubmissionRow = {
+  id: string;
+  status: "in_progress" | "submitted" | "graded";
+};
+
+type ExistingAnswerRow = {
+  question_id: string;
+  answer_text: string | null;
+  choice_id: string | null;
+};
 
 type Question =
   | {
       id: string;
       type: "mcq";
       prompt: string;
-      choices: string[];
       points: number;
+      choices: { id: string; label: string }[];
     }
   | {
       id: string;
       type: "short";
       prompt: string;
-      placeholder?: string;
       points: number;
+      placeholder?: string;
     };
 
-type Assessment = {
-  id: string; // a1/a2/a3...
-  type: AssessmentType;
-  title: string;
-  course: string;
-  section: string;
-  durationMin?: number;
-  totalPoints: number;
-  questions: Question[];
-};
+function normalizeCourse(value: AssessmentRow["courses"]) {
+  if (!value) return null;
+  return Array.isArray(value) ? value[0] ?? null : value;
+}
+
+function normalizeSection(value: AssessmentRow["course_sections"]) {
+  if (!value) return null;
+  return Array.isArray(value) ? value[0] ?? null : value;
+}
 
 function pad2(n: number) {
   return String(n).padStart(2, "0");
 }
+
 function formatTime(totalSeconds: number) {
   const m = Math.floor(totalSeconds / 60);
   const s = totalSeconds % 60;
   return `${pad2(m)}:${pad2(s)}`;
 }
 
-// mapping routeId demo -> storeId réel
-function toAssessmentId(routeId?: string) {
-  const map: Record<string, string> = {
-    sa1: "a1",
-    sa2: "a2",
-    sa3: "a3",
-    sa4: "a1", // démo : remappé
-    a1: "a1",
-    a2: "a2",
-    a3: "a3",
-  };
-  return map[routeId || "sa1"] || "a1";
-}
-
-// ✅ Questions uniques (doivent matcher Result + TeacherGradingDetail)
-const QUESTIONS: Question[] = [
-  {
-    id: "q1",
-    type: "mcq",
-    prompt: "Quel est le résultat de 8 + 5 ?",
-    choices: ["11", "12", "13", "14"],
-    points: 2,
-  },
-  {
-    id: "q2",
-    type: "mcq",
-    prompt: "Lequel est un nombre pair ?",
-    choices: ["9", "11", "12", "15"],
-    points: 2,
-  },
-  {
-    id: "q3",
-    type: "short",
-    prompt: "Explique en une phrase ce qu’est une fraction.",
-    placeholder: "Ta réponse...",
-    points: 6,
-  },
-  {
-    id: "q4",
-    type: "mcq",
-    prompt: "Quelle unité mesure une énergie ? (démo)",
-    choices: ["Watt", "Joule", "Newton", "Volt"],
-    points: 2,
-  },
-  {
-    id: "q5",
-    type: "short",
-    prompt: "Donne un exemple de situation où l’on consomme de l’énergie.",
-    placeholder: "Ex: ...",
-    points: 8,
-  },
-];
-
-function computeTotalPoints(qs: Question[]) {
-  return qs.reduce((acc, q) => acc + q.points, 0);
+function typeLabel(type: AssessmentType) {
+  if (type === "assignment") return "Devoir";
+  if (type === "exam") return "Examen";
+  return "Quiz";
 }
 
 export default function StudentAssessmentTake() {
   const navigate = useNavigate();
-  const params = useParams<{ id: string }>();
-  const routeId = params.id;
+  const { id } = useParams<{ id: string }>();
+  const { user, loading: authLoading } = useAuth();
 
-  const studentId = "demo-student";
+  const [assessment, setAssessment] = useState<AssessmentRow | null>(null);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [existingSubmissionId, setExistingSubmissionId] = useState<string | null>(null);
+  const [existingSubmissionStatus, setExistingSubmissionStatus] = useState<
+    "in_progress" | "submitted" | "graded" | null
+  >(null);
 
-  // seed (safe)
-  useEffect(() => {
-    ensureSeed();
-  }, []);
-
-  // ✅ store id: a1/a2/a3
-  const assessmentId = useMemo(() => toAssessmentId(routeId), [routeId]);
-
-  // ✅ base info depuis le store (titre/type/infos)
-  const published = useMemo(() => getAssessmentById(assessmentId), [assessmentId]);
-
-  // ✅ fallback demo si store pas trouvé (évite crash)
-  const assessment = useMemo<Assessment>(() => {
-    const fallbackType: AssessmentType =
-      assessmentId === "a3" ? "Examen" : assessmentId === "a2" ? "Devoir" : "Quiz";
-
-    const meta = published
-      ? {
-          type: published.type,
-          title: published.title,
-          course: published.courseTitle,
-          section: published.sectionTitle,
-          durationMin: published.type === "Examen" ? 30 : undefined,
-        }
-      : {
-          type: fallbackType,
-          title: fallbackType === "Quiz" ? "Quiz — Chapitre 1" : "Évaluation",
-          course: "Cours",
-          section: "Section",
-          durationMin: fallbackType === "Examen" ? 30 : undefined,
-        };
-
-    return {
-      id: assessmentId,
-      type: meta.type,
-      title: meta.title,
-      course: meta.course,
-      section: meta.section,
-      durationMin: meta.durationMin,
-      questions: QUESTIONS,
-      totalPoints: computeTotalPoints(QUESTIONS),
-    };
-  }, [assessmentId, published]);
-
-  // ✅ si déjà une tentative existe (in_progress/submitted…), on la reprend
-  const existingAttempt = useMemo(() => {
-    return getAttemptFor(assessment.id, studentId);
-  }, [assessment.id]);
-
-  // ---- Etats ----
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // ✅ charge réponses depuis attempt si existante
+  const submitLockRef = useRef(false);
+  const timerStartedRef = useRef(false);
+
+  const loadAssessment = useCallback(async () => {
+    if (!id) {
+      setError("Évaluation introuvable.");
+      setLoading(false);
+      return;
+    }
+
+    if (!user || user.isDemo) {
+      setError("La soumission réelle n’est pas disponible en mode démo.");
+      setLoading(false);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      const { data: assessmentData, error: assessmentError } = await supabase
+        .from("assessments")
+        .select(
+          `
+          id,
+          title,
+          description,
+          type,
+          course_id,
+          section_id,
+          time_limit_minutes,
+          max_score,
+          courses (
+            id,
+            title
+          ),
+          course_sections (
+            id,
+            title
+          )
+        `
+        )
+        .eq("id", id)
+        .single();
+
+      if (assessmentError) throw assessmentError;
+
+      const assessmentRow = assessmentData as AssessmentRow;
+
+      const { data: questionRowsData, error: questionsError } = await supabase
+        .from("quiz_questions")
+        .select("id, assessment_id, question_type, prompt, order_index")
+        .eq("assessment_id", id)
+        .order("order_index", { ascending: true });
+
+      if (questionsError) throw questionsError;
+
+      const questionRows = (questionRowsData ?? []) as QuizQuestionRow[];
+      const questionIds = questionRows.map((q) => q.id);
+
+      let choiceRows: QuizChoiceRow[] = [];
+      if (questionIds.length > 0) {
+        const { data: choiceRowsData, error: choicesError } = await supabase
+          .from("quiz_choices")
+          .select("id, question_id, choice_text")
+          .in("question_id", questionIds);
+
+        if (choicesError) throw choicesError;
+
+        choiceRows = (choiceRowsData ?? []) as QuizChoiceRow[];
+      }
+
+      const { data: existingSubmissionData, error: existingSubmissionError } = await supabase
+        .from("submissions")
+        .select("id, status")
+        .eq("assessment_id", id)
+        .eq("student_id", user.id)
+        .maybeSingle();
+
+      if (existingSubmissionError) throw existingSubmissionError;
+
+      const existingSubmission = existingSubmissionData as ExistingSubmissionRow | null;
+
+      let initialAnswers: Record<string, string> = {};
+
+      if (existingSubmission) {
+        setExistingSubmissionId(existingSubmission.id);
+        setExistingSubmissionStatus(existingSubmission.status);
+
+        const { data: existingAnswersData, error: existingAnswersError } = await supabase
+          .from("submission_answers")
+          .select("question_id, answer_text, choice_id")
+          .eq("submission_id", existingSubmission.id);
+
+        if (existingAnswersError) throw existingAnswersError;
+
+        const answerRows = (existingAnswersData ?? []) as ExistingAnswerRow[];
+
+        initialAnswers = answerRows.reduce<Record<string, string>>((acc, row) => {
+          if (row.choice_id) {
+            acc[row.question_id] = row.choice_id;
+          } else if (row.answer_text) {
+            acc[row.question_id] = row.answer_text;
+          }
+          return acc;
+        }, {});
+      } else {
+        setExistingSubmissionId(null);
+        setExistingSubmissionStatus(null);
+      }
+
+      const mappedQuestions: Question[] =
+        questionRows.length > 0
+          ? questionRows.map((q) => {
+              const points =
+                assessmentRow.max_score && questionRows.length > 0
+                  ? Math.max(1, Math.round(assessmentRow.max_score / questionRows.length))
+                  : 1;
+
+              if (q.question_type === "mcq" || q.question_type === "true_false") {
+                const choices =
+                  q.question_type === "true_false"
+                    ? [
+                        { id: `${q.id}-true`, label: "Vrai" },
+                        { id: `${q.id}-false`, label: "Faux" },
+                      ]
+                    : choiceRows
+                        .filter((choice) => choice.question_id === q.id)
+                        .map((choice) => ({
+                          id: choice.id,
+                          label: choice.choice_text,
+                        }));
+
+                return {
+                  id: q.id,
+                  type: "mcq" as const,
+                  prompt: q.prompt,
+                  points,
+                  choices,
+                };
+              }
+
+              return {
+                id: q.id,
+                type: "short" as const,
+                prompt: q.prompt,
+                points,
+                placeholder: "Votre réponse...",
+              };
+            })
+          : [
+              {
+                id: "fallback-open-question",
+                type: "short" as const,
+                prompt:
+                  assessmentRow.description?.trim() ||
+                  "Répondez aux consignes de cette évaluation.",
+                points: assessmentRow.max_score ?? 20,
+                placeholder: "Votre réponse...",
+              },
+            ];
+
+      setAssessment(assessmentRow);
+      setQuestions(mappedQuestions);
+      setAnswers(initialAnswers);
+      setCurrentIndex(0);
+    } catch (err) {
+      console.error("[StudentAssessmentTake] loadAssessment error:", err);
+      setError("Impossible de charger cette évaluation.");
+      setAssessment(null);
+      setQuestions([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [id, user]);
+
   useEffect(() => {
-    setCurrentIndex(0);
-    setSubmitting(false);
-    setAnswers(existingAttempt?.answers ?? {});
-  }, [assessment.id, existingAttempt?.id]);
+    if (authLoading) return;
+    void loadAssessment();
+  }, [authLoading, loadAssessment]);
 
-  const current = assessment.questions[currentIndex];
-  const total = assessment.questions.length;
+  const total = questions.length;
+  const current = questions[currentIndex];
 
   const answeredCount = useMemo(() => {
-    return assessment.questions.reduce(
+    return questions.reduce(
       (acc, q) => acc + ((answers[q.id] || "").trim() ? 1 : 0),
       0
     );
-  }, [answers, assessment.questions]);
+  }, [answers, questions]);
 
   const progress = Math.round((answeredCount / Math.max(1, total)) * 100);
 
-  // ---- Timer ----
-  const hasTimer = assessment.type === "Examen" || typeof assessment.durationMin === "number";
+  const hasTimer =
+    assessment?.type === "exam" || typeof assessment?.time_limit_minutes === "number";
+
   const initialSeconds = useMemo(() => {
-    const d = assessment.durationMin ?? (assessment.type === "Examen" ? 30 : undefined);
-    return d ? d * 60 : 0;
-  }, [assessment.durationMin, assessment.type]);
+    const minutes =
+      assessment?.time_limit_minutes ?? (assessment?.type === "exam" ? 30 : 0);
+    return minutes ? minutes * 60 : 0;
+  }, [assessment?.time_limit_minutes, assessment?.type]);
 
-  const [secondsLeft, setSecondsLeft] = useState(initialSeconds);
+  const [secondsLeft, setSecondsLeft] = useState(0);
 
-  // reset timer quand l’éval change
   useEffect(() => {
-    if (!hasTimer) return;
+    if (!hasTimer) {
+      timerStartedRef.current = true;
+      return;
+    }
+
+    timerStartedRef.current = false;
     setSecondsLeft(initialSeconds);
+
+    const t = window.setTimeout(() => {
+      timerStartedRef.current = true;
+    }, 0);
+
+    return () => window.clearTimeout(t);
   }, [hasTimer, initialSeconds]);
 
-  // tick timer
   useEffect(() => {
     if (!hasTimer) return;
     if (submitting) return;
@@ -206,12 +350,11 @@ export default function StudentAssessmentTake() {
     return () => window.clearInterval(t);
   }, [hasTimer, secondsLeft, submitting]);
 
-  // anti double-submit (timer / click)
-  const submitLockRef = useRef(false);
+  const isDirty = useMemo(
+    () => answeredCount > 0 && !submitting && existingSubmissionStatus !== "submitted",
+    [answeredCount, submitting, existingSubmissionStatus]
+  );
 
-  const isDirty = useMemo(() => answeredCount > 0 && !submitting, [answeredCount, submitting]);
-
-  // ✅ Empêche quitter par erreur (refresh/fermeture onglet)
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       if (!isDirty) return;
@@ -222,13 +365,14 @@ export default function StudentAssessmentTake() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [isDirty]);
 
-  function setAnswer(qid: string, value: string) {
-    setAnswers((prev) => ({ ...prev, [qid]: value }));
+  function setAnswer(questionId: string, value: string) {
+    setAnswers((prev) => ({ ...prev, [questionId]: value }));
   }
 
   function goPrev() {
     setCurrentIndex((i) => Math.max(0, i - 1));
   }
+
   function goNext() {
     setCurrentIndex((i) => Math.min(total - 1, i + 1));
   }
@@ -243,58 +387,161 @@ export default function StudentAssessmentTake() {
     navigate(-1);
   }
 
-  function doSubmit(auto = false) {
-    if (submitting) return;
-    if (submitLockRef.current) return;
-    submitLockRef.current = true;
-
-    setSubmitting(true);
-
-    // snapshot stable
-    const snapshotAnswers = { ...answers };
-
-    window.setTimeout(() => {
-      // ✅ workflow B : on crée/maj une tentative en status "submitted"
-      submitAttempt({
-        assessmentId: assessment.id,
-        studentId,
-        answers: snapshotAnswers,
-      });
-
-      setSubmitting(false);
-      submitLockRef.current = false;
-
-      // ✅ direction résultat (où on affichera grading ensuite)
-      navigate(`/app/student/assessments/${assessment.id}/result`, { replace: true });
-
-      // mini toast (démo)
-      if (auto) {
-        alert("⏰ Temps écoulé — soumission effectuée (démo).");
+  const doSubmit = useCallback(
+    async (auto = false) => {
+      if (!id || !user) return;
+      if (submitting) return;
+      if (submitLockRef.current) return;
+      if (existingSubmissionStatus === "submitted" || existingSubmissionStatus === "graded") {
+        return;
       }
-    }, 350);
-  }
 
-  // auto submit à 0
+      submitLockRef.current = true;
+      setSubmitting(true);
+
+      try {
+        let submissionId = existingSubmissionId;
+
+        if (!submissionId) {
+          const { data: insertedSubmission, error: insertSubmissionError } = await supabase
+            .from("submissions")
+            .insert({
+              assessment_id: id,
+              student_id: user.id,
+              submitted_at: new Date().toISOString(),
+              status: "submitted",
+            })
+            .select("id")
+            .single();
+
+          if (insertSubmissionError) throw insertSubmissionError;
+
+          submissionId = insertedSubmission.id as string;
+        } else {
+          const { error: updateSubmissionError } = await supabase
+            .from("submissions")
+            .update({
+              submitted_at: new Date().toISOString(),
+              status: "submitted",
+            })
+            .eq("id", submissionId);
+
+          if (updateSubmissionError) throw updateSubmissionError;
+        }
+
+        const { error: deleteAnswersError } = await supabase
+          .from("submission_answers")
+          .delete()
+          .eq("submission_id", submissionId);
+
+        if (deleteAnswersError) throw deleteAnswersError;
+
+        const payload: {
+          submission_id: string;
+          question_id: string;
+          answer_text: string | null;
+          choice_id: string | null;
+        }[] = [];
+
+        for (const q of questions) {
+          const raw = (answers[q.id] || "").trim();
+          if (!raw) continue;
+
+          if (q.type === "mcq") {
+            const isFallbackTrueFalse = raw === `${q.id}-true` || raw === `${q.id}-false`;
+
+            payload.push({
+              submission_id: submissionId,
+              question_id: q.id,
+              answer_text: isFallbackTrueFalse
+                ? raw === `${q.id}-true`
+                  ? "Vrai"
+                  : "Faux"
+                : null,
+              choice_id: isFallbackTrueFalse ? null : raw,
+            });
+          } else {
+            payload.push({
+              submission_id: submissionId,
+              question_id: q.id,
+              answer_text: raw,
+              choice_id: null,
+            });
+          }
+        }
+
+        if (payload.length > 0) {
+          const { error: insertAnswersError } = await supabase
+            .from("submission_answers")
+            .insert(payload);
+
+          if (insertAnswersError) throw insertAnswersError;
+        }
+
+        navigate("/app/student/assessments", { replace: true });
+
+        if (auto) {
+          alert("⏰ Temps écoulé — soumission effectuée.");
+        } else {
+          alert("✅ Soumission enregistrée.");
+        }
+      } catch (err: any) {
+        console.error("[StudentAssessmentTake] submit error:", err);
+
+        const message =
+        err?.message ||
+        err?.error_description ||
+        err?.details ||
+        "Impossible de soumettre l’évaluation.";
+
+        setError(message);
+      } finally {
+        setSubmitting(false);
+        submitLockRef.current = false;
+      }
+    },
+    [
+      id,
+      user,
+      submitting,
+      existingSubmissionId,
+      existingSubmissionStatus,
+      questions,
+      answers,
+      navigate,
+    ]
+  );
+
   useEffect(() => {
     if (!hasTimer) return;
-    if (secondsLeft === 0) doSubmit(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [secondsLeft, hasTimer]);
+    if (!timerStartedRef.current) return;
+    if (secondsLeft === 0 && initialSeconds > 0) {
+      void doSubmit(true);
+    }
+  }, [secondsLeft, hasTimer, initialSeconds, doSubmit]);
 
   const showWarning = hasTimer && secondsLeft <= 60;
 
+  const isReadOnly =
+    existingSubmissionStatus === "submitted" || existingSubmissionStatus === "graded";
+
+  const assessmentTypeLabel = assessment ? typeLabel(assessment.type) : "Évaluation";
+  const courseTitle = assessment ? normalizeCourse(assessment.courses)?.title ?? "Cours" : "Cours";
+  const sectionTitle = assessment
+    ? normalizeSection(assessment.course_sections)?.title ?? "Sans section"
+    : "Sans section";
+
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-xl font-semibold">{assessment.title}</div>
+          <div className="text-xl font-semibold">{assessment?.title ?? "Évaluation"}</div>
           <div className="text-sm text-gray-500">
-            {assessment.course} • {assessment.section}
+            {courseTitle} • {sectionTitle}
           </div>
-          {existingAttempt?.submittedAtISO && (
+          {isReadOnly && (
             <div className="mt-1 text-xs text-gray-500">
-              Reprise d’une tentative enregistrée (démo).
+              Cette évaluation a déjà été soumise.
             </div>
           )}
         </div>
@@ -309,169 +556,207 @@ export default function StudentAssessmentTake() {
               className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm ${
                 showWarning ? "bg-red-600 text-white" : "bg-gray-100 text-gray-800"
               }`}
-              title="Timer (démo)"
             >
               ⏱ {formatTime(Math.max(0, secondsLeft))}
             </div>
           )}
 
-          <button className="sn-btn-primary sn-press" onClick={() => doSubmit(false)} disabled={submitting}>
-            {submitting ? (
-              <span className="inline-flex items-center gap-2">
-                <span className="h-4 w-4 rounded-full border-2 border-white/60 border-t-white animate-spin" />
-                Soumission...
-              </span>
-            ) : (
-              "Soumettre"
-            )}
+          <button
+            className="sn-btn-primary sn-press"
+            onClick={() => void doSubmit(false)}
+            disabled={submitting || isReadOnly}
+          >
+            {submitting ? "Soumission..." : "Soumettre"}
           </button>
         </div>
       </div>
 
-      {/* Progress / stats */}
-      <div className="sn-card p-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="text-sm text-gray-700">
-          Progression : <span className="font-semibold">{answeredCount}</span>/{total} réponses •{" "}
-          <span className="font-semibold">{progress}%</span>
+      {user?.isDemo && (
+        <div className="sn-card p-4 text-sm text-amber-700 bg-amber-50 border border-amber-200">
+          Mode démo actif : la soumission réelle est désactivée.
         </div>
+      )}
 
-        <div className="flex items-center gap-3">
-          <span className="sn-badge sn-badge-gray">{assessment.type}</span>
-          <span className="sn-badge sn-badge-gray">{assessment.totalPoints} pts</span>
-          {hasTimer && <span className="sn-badge sn-badge-gray">{assessment.durationMin ?? 30} min</span>}
-        </div>
-      </div>
-
-      {/* Content grid */}
-      <div className="grid gap-4 lg:grid-cols-3">
-        {/* Question */}
-        <div className="lg:col-span-2 sn-card p-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="font-semibold">
-              Question {currentIndex + 1} / {total}
-            </div>
-            <span className="sn-badge sn-badge-gray">{current.points} pts</span>
+      {(authLoading || loading) && (
+        <div className="grid gap-4 lg:grid-cols-3">
+          <div className="lg:col-span-2 sn-card p-5 space-y-4 animate-pulse">
+            <div className="h-5 w-1/3 rounded bg-gray-200" />
+            <div className="h-24 rounded bg-gray-100" />
+            <div className="h-10 w-32 rounded bg-gray-200" />
           </div>
-
-          <div className="text-gray-900 font-semibold">{current.prompt}</div>
-
-          {current.type === "mcq" ? (
-            <div className="grid gap-2 sm:grid-cols-2">
-              {current.choices.map((c) => {
-                const selected = answers[current.id] === c;
-                return (
-                  <button
-                    key={c}
-                    type="button"
-                    disabled={submitting}
-                    className={`rounded-2xl border p-3 text-left transition sn-press ${
-                      selected ? "border-blue-600 bg-blue-50" : "border-gray-100 bg-white hover:bg-gray-50"
-                    }`}
-                    onClick={() => setAnswer(current.id, c)}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="text-sm text-gray-900">{c}</div>
-                      {selected && <span className="sn-badge sn-badge-blue">Choisi</span>}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="space-y-2">
-              <textarea
-                className="w-full min-h-[140px] rounded-2xl border border-gray-200 bg-white p-3 text-sm outline-none focus:ring-2 focus:ring-blue-200"
-                placeholder={current.placeholder || "Votre réponse..."}
-                value={answers[current.id] || ""}
-                onChange={(e) => setAnswer(current.id, e.target.value)}
-                disabled={submitting}
-              />
-              <div className="text-xs text-gray-500">
-                Astuce : réponds clairement. La correction sera faite par l’enseignant (devoir/examen).
-              </div>
-            </div>
-          )}
-
-          <div className="flex items-center justify-between pt-2">
-            <button className="sn-btn-ghost sn-press" onClick={goPrev} disabled={currentIndex === 0 || submitting}>
-              ← Précédent
-            </button>
-
-            <button
-              className="sn-btn-primary sn-press"
-              onClick={goNext}
-              disabled={currentIndex === total - 1 || submitting}
-            >
-              Suivant →
-            </button>
+          <div className="sn-card p-5 space-y-4 animate-pulse">
+            <div className="h-5 w-1/2 rounded bg-gray-200" />
+            <div className="h-20 rounded bg-gray-100" />
           </div>
         </div>
+      )}
 
-        {/* Navigator / summary */}
-        <div className="space-y-4">
-          <div className="sn-card p-5 space-y-3">
-            <div className="font-semibold">Questions</div>
+      {!authLoading && !loading && error && (
+        <div className="sn-card p-4 bg-red-50 border border-red-200 text-red-700">
+          {error}
+        </div>
+      )}
 
-            <div className="grid grid-cols-5 gap-2">
-              {assessment.questions.map((q, idx) => {
-                const has = (answers[q.id] || "").trim().length > 0;
-                const active = idx === currentIndex;
-
-                return (
-                  <button
-                    key={q.id}
-                    type="button"
-                    onClick={() => setCurrentIndex(idx)}
-                    disabled={submitting}
-                    className={`h-10 rounded-xl text-sm font-semibold transition sn-press ${
-                      active
-                        ? "bg-blue-600 text-white"
-                        : has
-                        ? "bg-blue-50 text-blue-700 hover:bg-blue-100"
-                        : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-                    }`}
-                    title={has ? "Répondu" : "Non répondu"}
-                  >
-                    {idx + 1}
-                  </button>
-                );
-              })}
+      {!authLoading && !loading && !error && assessment && current && (
+        <>
+          <div className="sn-card p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="text-sm text-gray-700">
+              Progression : <span className="font-semibold">{answeredCount}</span>/{total} réponses •{" "}
+              <span className="font-semibold">{progress}%</span>
             </div>
 
-            <div className="text-xs text-gray-500">Bleu clair = répondu • Gris = à faire • Bleu = active</div>
-          </div>
-
-          <div className="sn-card p-5 space-y-3">
-            <div className="font-semibold">Résumé</div>
-            <div className="text-sm text-gray-700 space-y-1">
-              <div>
-                Réponses : <span className="font-semibold">{answeredCount}</span>/{total}
-              </div>
-              <div>
-                Points max : <span className="font-semibold">{assessment.totalPoints}</span>
-              </div>
+            <div className="flex items-center gap-3">
+              <span className="sn-badge sn-badge-gray">{assessmentTypeLabel}</span>
+              <span className="sn-badge sn-badge-gray">{assessment.max_score ?? "—"} pts</span>
               {hasTimer && (
-                <div>
-                  Temps restant :{" "}
-                  <span className={`font-semibold ${showWarning ? "text-red-600" : ""}`}>
-                    {formatTime(Math.max(0, secondsLeft))}
-                  </span>
-                </div>
+                <span className="sn-badge sn-badge-gray">
+                  {assessment.time_limit_minutes ?? 30} min
+                </span>
               )}
             </div>
-
-            <div className="pt-2">
-              <button className="sn-btn-primary w-full sn-press" onClick={() => doSubmit(false)} disabled={submitting}>
-                {submitting ? "Soumission..." : "Soumettre"}
-              </button>
-            </div>
-
-            <div className="text-xs text-gray-500">
-              *Mode démo : la soumission crée une tentative “submitted” (workflow correction enseignant).*
-            </div>
           </div>
-        </div>
-      </div>
+
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="lg:col-span-2 sn-card p-5 space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="font-semibold">
+                  Question {currentIndex + 1} / {total}
+                </div>
+                <span className="sn-badge sn-badge-gray">{current.points} pts</span>
+              </div>
+
+              <div className="text-gray-900 font-semibold">{current.prompt}</div>
+
+              {current.type === "mcq" ? (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {current.choices.map((choice) => {
+                    const selected = answers[current.id] === choice.id;
+                    return (
+                      <button
+                        key={choice.id}
+                        type="button"
+                        disabled={submitting || isReadOnly}
+                        className={`rounded-2xl border p-3 text-left transition sn-press ${
+                          selected
+                            ? "border-blue-600 bg-blue-50"
+                            : "border-gray-100 bg-white hover:bg-gray-50"
+                        }`}
+                        onClick={() => setAnswer(current.id, choice.id)}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-sm text-gray-900">{choice.label}</div>
+                          {selected && <span className="sn-badge sn-badge-blue">Choisi</span>}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <textarea
+                    className="w-full min-h-[140px] rounded-2xl border border-gray-200 bg-white p-3 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+                    placeholder={current.placeholder || "Votre réponse..."}
+                    value={answers[current.id] || ""}
+                    onChange={(e) => setAnswer(current.id, e.target.value)}
+                    disabled={submitting || isReadOnly}
+                  />
+                  <div className="text-xs text-gray-500">
+                    Réponds clairement. Cette réponse pourra être corrigée par l’enseignant.
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-2">
+                <button
+                  className="sn-btn-ghost sn-press"
+                  onClick={goPrev}
+                  disabled={currentIndex === 0 || submitting}
+                >
+                  ← Précédent
+                </button>
+
+                <button
+                  className="sn-btn-primary sn-press"
+                  onClick={goNext}
+                  disabled={currentIndex === total - 1 || submitting}
+                >
+                  Suivant →
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="sn-card p-5 space-y-3">
+                <div className="font-semibold">Questions</div>
+
+                <div className="grid grid-cols-5 gap-2">
+                  {questions.map((q, idx) => {
+                    const has = (answers[q.id] || "").trim().length > 0;
+                    const active = idx === currentIndex;
+
+                    return (
+                      <button
+                        key={q.id}
+                        type="button"
+                        onClick={() => setCurrentIndex(idx)}
+                        disabled={submitting}
+                        className={`h-10 rounded-xl text-sm font-semibold transition sn-press ${
+                          active
+                            ? "bg-blue-600 text-white"
+                            : has
+                            ? "bg-blue-50 text-blue-700 hover:bg-blue-100"
+                            : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                        }`}
+                        title={has ? "Répondu" : "Non répondu"}
+                      >
+                        {idx + 1}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="text-xs text-gray-500">
+                  Bleu clair = répondu • Gris = à faire • Bleu = active
+                </div>
+              </div>
+
+              <div className="sn-card p-5 space-y-3">
+                <div className="font-semibold">Résumé</div>
+                <div className="text-sm text-gray-700 space-y-1">
+                  <div>
+                    Réponses : <span className="font-semibold">{answeredCount}</span>/{total}
+                  </div>
+                  <div>
+                    Points max : <span className="font-semibold">{assessment.max_score ?? "—"}</span>
+                  </div>
+                  {hasTimer && (
+                    <div>
+                      Temps restant :{" "}
+                      <span className={`font-semibold ${showWarning ? "text-red-600" : ""}`}>
+                        {formatTime(Math.max(0, secondsLeft))}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-2">
+                  <button
+                    className="sn-btn-primary w-full sn-press"
+                    onClick={() => void doSubmit(false)}
+                    disabled={submitting || isReadOnly}
+                  >
+                    {submitting ? "Soumission..." : "Soumettre"}
+                  </button>
+                </div>
+
+                <div className="text-xs text-gray-500">
+                  *Cette vue crée maintenant une vraie soumission dans Supabase.*
+                </div>
+              </div>
+            </div>
+          </div>                                    
+        </>
+      )}
     </div>
   );
 }
